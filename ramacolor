@@ -1,0 +1,367 @@
+#!/usr/bin/python3
+"""
+Modified version of RAMACOLOR by Florian Sittel (www.lettis.net)
+
+Author: Daniel Nagel
+Version: 0.2.1
+Online: github.com/moldyn/ramacolor
+"""
+# ~~~ IMPORT ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+from __future__ import print_function  # for print() in python2
+import argparse
+import sys
+import random
+import warnings
+warnings.filterwarnings("ignore")
+
+
+# import own modules
+#import default_modules as dm
+#import pyplot_style as ps
+
+# import non default modules
+def importTry(module, module_short):
+    try:
+        lib = __import__(module)
+    except:
+        print('    ERROR: Install {}, eg. pip(3) install {}'.format(module, module))
+        sys.exit(1)
+    else:
+        globals()[module_short] = lib
+
+importTry('numpy', 'np')
+importTry('pandas', 'pd')
+importTry('progress', 'progress')  
+importTry('matplotlib', 'matplotlib')
+
+import pickle
+import progress.bar as pgb
+import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+# ~~~ GLOBAL VARIABLES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+rama2rgb_arr = np.empty([361, 361, 3])  # for each Phi/Psi an [R,G,B] array
+FILE_NAME = sys.argv[0]
+
+
+# ~~~ PLOT STYLE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+plt.rc('text', usetex=True)
+plt.rc('font', family='serif')
+plt.rc('pdf', fonttype=42)
+
+
+# ~~~ PARSER ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def get_args():
+    """Parsing all input."""
+    parser = argparse.ArgumentParser(
+        description='Generate ramacolor plot.', \
+        epilog = 65*'~')
+    parser.add_argument(
+        "-ms", "--microstates_selection", nargs="+", type=int,
+        help="Selection of microstates. Default: use all.")
+    parser.add_argument(
+        "-d", "--dihedrals", type=str,
+        help="ASCII file with dihedrals (in degrees!).")
+    parser.add_argument( 
+        "-s", "--states", type=str,
+        help="single-column ASCII file with states (i.e. clustered trajectory).")
+    parser.add_argument(
+        "--overview", action="store_true", help="plot color palette overview.")
+    parser.add_argument(
+        "--store", type=str, help="store state classification to file.")
+    parser.add_argument(
+        "--load", type=str, help="load state classification from file.")
+    parser.add_argument(
+        "--export", default=None,
+        help="export as image. (e.g. --export plot.png). supported formats: pdf, png.")
+    parser.add_argument(
+        "--fast", action="store_true",
+        help="Speeds up the calculation by assuming phi/psi independtly.")
+    parser.add_argument(
+        "--monte_carlo", action="store_true",
+        help="Speeds up the calculation by selecting at maximum 1 percent of" +
+             "all frames per state.")
+
+    args = parser.parse_args()
+
+    return args.microstates_selection, args.dihedrals, args.states, \
+        args.overview, args.store, args.load, args.export, \
+        args.fast, args.monte_carlo
+
+
+# ~~~ MAIN ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def main():
+    """Run script."""
+    # print head
+    print('\n' + ' '*int((65-len(FILE_NAME) - 6)/2.) +
+          '~~ {} ~~\n'.format(FILE_NAME) + 65*'~')
+    
+    # parse
+    ms_selection, file_dih, file_ms, overview, name_store, files_load, \
+        export_img, fast, monte_carlo = get_args()
+    
+    # generate an conversion array from (Phi,Psi)->RGB-color
+    fill_rama2rgb_arr()
+    
+    # ~~~ RUN MAIN CODE ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~    
+    if overview:
+        plot_overview(export_img)        
+    elif files_load:
+        classifications = load_state_classification(files_load)
+        plot_state_classification(classifications, export_img=export_img)  
+    elif file_dih and file_ms:
+        classification_tuple = \
+            compute_state_classification(file_dih, file_ms, ms_selection,
+                                         fast, monte_carlo)
+        if name_store:
+            save_state_classification(classification_tuple, name_store)
+            
+        plot_state_classification(classification_tuple, export_img=export_img)
+    else:
+        print("   ERROR: no option selected. Use -h for help")    
+    pexit(0)
+
+
+# ~~~ MAIN METHODS ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def plot_state_classification(classification_tuples, export_img=None):
+    img = classification_tuples[0]
+    state_names = classification_tuples[1]
+    n_res = len(img)
+    n_ms = len(img[0])
+
+    plt.figure(figsize=((n_ms+10)*10./60.,(n_res+12)*3./39.))
+    plt.ylabel('Residues')
+    plt.xlabel('States')
+    x_scaling = 3
+    plt.imshow(img[::-1],  # inverse order
+               extent=[0, x_scaling*n_ms, 0, n_res],
+               interpolation="none",
+               aspect="auto")
+
+    # state labels
+    x_ticks_pos = [(x+0.5)*x_scaling for x in np.arange(n_ms)]
+    x_ticks_names = ['{}'.format(ms) for ms in state_names]
+    plt.xticks(x_ticks_pos, x_ticks_names)
+    # residue labels
+    ticks_steps = 2
+    y_ticks_pos = [y+0.5 for y in np.arange(0, n_res,ticks_steps)]
+    y_ticks_names = ['{}'.format(y+1.5) for y in y_ticks_pos]
+    plt.yticks(y_ticks_pos, y_ticks_names)
+    
+    # save result
+    plt.tight_layout()
+    if export_img:
+        if export_img.endswith(('.pdf', '.png')):
+            plt.savefig(export_img, bbox_inches='tight')
+        else:
+            print('   only pdf and png is supported, saved as pdf.')
+            plt.savefig(export_img + '.pdf', bbox_inches='tight')
+    else:
+        plt.show()
+
+def compute_state_classification(file_dih, file_ms, ms_selection,
+                                 fast, monte_carlo):
+    """
+    file_dih: dihedral file with mulitple Phi/Psi column pairs
+    file_ms: single column file with state assignment
+    ms_selection: default false. Take all available states of file_ms
+    fast: phi/psi are averaged before taking the color
+    monte_carlo: If true for each state at maximum 1 percent of total frames
+                 are used
+                 
+    return: triple [image, names, nRes] where,
+            image: image with dimension #residues x #microstates where each
+                   pixel is represented by [r,g,b] values.
+            names: are the names of used microstates
+            nRes: is the number of residues
+    """
+    print('~~~ open as state file: {}'.format(file_ms))    
+    data_ms = pd.read_csv(file_ms, sep=' ', header=None).values.flatten()
+    
+    # find all different microstates:
+    microstates, ms_counts = np.unique(data_ms, return_counts=True)
+    # merge in 2d
+    microstatesCount = np.column_stack((microstates, ms_counts))
+    
+    # consider at a maximum 2 percent of total frames per each state
+    maxFrames = int(np.ceil(0.01*len(data_ms)))
+    
+    if ms_selection:
+        # check if microstate is in i_ms
+        for ms in ms_selection:
+            if not ms in microstates:
+                print('    ERROR: Microstate ms{:.0f} does not exists.'
+                      .format(ms))
+                pexit(0)
+        print('    Use only ms: ', end='')
+        print(*ms_selection, sep=', ')
+        microstates = ms_selection
+    else:
+        print('    Use all {:.0f} states: {:.0f}-{:.0f}'
+              .format(len(microstates),
+                      np.min(microstates),
+                      np.max(microstates)))
+
+    # get all different different columns and reshape them in (phi/psi) tuples     
+    allColumns = pd.read_csv(file_dih, sep=' ', header=None, nrows=1).columns
+    tupleColumns = np.reshape(allColumns.values,(-1,2))
+    
+    # number of residues, microstates
+    n_res = len(tupleColumns)
+    n_ms = len(microstates)
+    
+    # generate empty image array.
+    img = np.empty([n_res, n_ms, 3])
+
+    # if --monte_carlo drops randomly frames
+    if monte_carlo:
+        print('    --monte_carlo is used. The result is NOT exact.')
+        print('    For each state maximal {:.0f} frames are used.'
+              .format(maxFrames))
+        for ms in microstates:            
+            # drop random frames
+            if len(data_ms[data_ms == ms]) > maxFrames:
+                indices = np.where(data_ms == ms)[0]
+                indices = random.sample(indices.tolist(), len(indices)-maxFrames)
+                data_ms[indices] = np.min(microstates) - 1                
+    if fast:
+        print('    --fast is used. The result is NOT exact.')
+
+    print('~~~ generate classification:')
+    bar = EtaBar(message = '   ', max = len(tupleColumns))  # Progress bar
+    for i_res, column in enumerate(tupleColumns):
+        # load phi/psi pair from dihedral file
+        data_dih = pd.read_csv(file_dih,
+                               sep=' ',  # TODO: compare to '\s+'
+                               header=None,
+                               usecols=column).values
+        for i_ms, ms in enumerate(microstates):
+            data_result = data_dih[data_ms == ms]
+            if not fast:
+                rama_array = [rama2rgb_arr[int(180+psi),int(180+phi)] \
+                                for phi,psi in data_result]
+            else:  # first average phi,psi than to color
+                phi_av = np.average(data_result[:,0])
+                psi_av = np.average(data_result[:,1])                
+                rama_array = [rama2rgb_arr[int(180+psi_av), int(180+phi_av)]]
+
+            # average over each color channel, so <R><G><B>
+            img[i_res, i_ms] = np.average(rama_array, axis=0)
+
+        bar.next()
+    bar.finish()
+    return img, microstates
+
+
+# ~~~ HELPER FUNCTIONS ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def pexit(i):  # same as sys.exit(i) but prints first the epilog
+    # print foot
+    print(65*'~')
+    sys.exit(i)
+
+
+def pdist2(ref_phi, ref_psi, phi, psi):
+    return np.min([(ref_phi    -phi)**2 + (ref_psi-psi)**2,
+                   (ref_phi-360-phi)**2 + (ref_psi-psi)**2,
+                   (ref_phi+360-phi)**2 + (ref_psi-psi)**2,
+                   (ref_phi    -phi)**2 + (ref_psi-360-psi)**2,
+                   (ref_phi    -phi)**2 + (ref_psi+360-psi)**2,
+                   (ref_phi-360-phi)**2 + (ref_psi-360-psi)**2,
+                   (ref_phi+360-phi)**2 + (ref_psi-360-psi)**2,
+                   (ref_phi-360-phi)**2 + (ref_psi+360-psi)**2,
+                   (ref_phi+360-phi)**2 + (ref_psi+360-psi)**2])
+
+
+def rama2rgb(phi, psi):
+    r = pdist2(-120, 120, phi, psi)
+    g = pdist2(-60, -60, phi, psi)
+    b = pdist2( 60,  60, phi, psi)
+    rescale = lambda x: 1-(np.sqrt(x) / np.sqrt(2)/180.0)
+    return [rescale(r), rescale(g), rescale(b)]
+
+
+def fill_rama2rgb_arr():
+    for i in range(-180, 181):
+        for j in range(-180, 181):
+            rama2rgb_arr[180+i,180+j] = rama2rgb(j,i)
+
+
+def plot_overview(export_img = None):
+    """
+    Plots an overview of RGB(Phi,Psi).
+    
+    export_img: If given, overview is saved as export_img, else show result.
+    """    
+    ext = [-180.0, 179.0, -180.0, 179.0]
+    plt.imshow(rama2rgb_arr, extent=ext, origin="lower", interpolation="none")
+    plt.xlabel(r'$\phi$')
+    plt.ylabel(r'$\psi$')
+    if export_img:
+        plt.savefig(export_img, bbox_inches='tight')
+    else:
+        plt.show()
+
+
+def convertRGB2HEXimage(img):
+    n_ms, n_res = len(img), len(img[0])
+    imgHex = np.full([n_ms, n_res], '#ffffff')  # white image
+    
+    for i_ms in range(n_ms):
+        for i_res in range(n_res):    
+            imgHex[i_ms, i_res] = matplotlib.colors.to_hex(img[i_ms, i_res])
+
+    return imgHex
+
+
+def convertHEX2RGBimage(img):
+    n_ms, n_res = len(img), len(img[0])
+    imgRGB = np.full([n_ms, n_res, 3], 1.)  # white image
+    
+    for i_ms in range(n_ms):
+        for i_res in range(n_res):
+            imgRGB[i_ms, i_res] = matplotlib.colors.to_rgb(img[i_ms, i_res])
+    
+    return imgRGB
+
+
+def save_state_classification(classification_tuple, output_name):
+    img = classification_tuple[0]
+    microstates = classification_tuple[1]
+    
+    imgHex = convertRGB2HEXimage(img)
+    # convert to object to be able to append floats
+    imgHex = imgHex.astype(np.object)
+    savingArray = np.vstack([imgHex, microstates])
+    
+    header = 'This file was generated by {} with:\n'.format(FILE_NAME)
+    for arg in sys.argv:  # loop over the given arguments
+        header += '{} '.format(arg)
+    header += '\n#microstates times #residues ' + \
+              'microstates are saved in lowest row.'
+    
+    np.savetxt(output_name, savingArray, header=header, fmt='%s')
+
+
+def load_state_classification(file_name):
+    savedArray = np.loadtxt(file_name, comments='# ', dtype=np.object)
+
+    imgHex = savedArray[:-1]
+    microstates = savedArray[-1]
+    
+    imgRGB = convertHEX2RGBimage(imgHex)
+    return imgRGB, microstates
+
+
+# ~~~ PROGRESS LOADING ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+class EtaBar(pgb.Bar):
+    message = '   '
+    suffix = '%(percent)d%% - %(remaining_min)d min %(remaining_sec)d s remaining'
+    @property
+    def remaining_min(self):
+        return int(self.eta / 60)
+    @property
+    def remaining_sec(self):
+        return int(self.eta - int(self.eta/60)*60)
+
+if __name__ == "__main__":
+    main()
